@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "demucs-separator"
+version = "1.0.0"
+description = "Local vocal separation using Demucs htdemucs and MDX mdx_extra via demucs-infer"
+requires-python = ">=3.12"
+dependencies = ["demucs-infer>=4.0.0"]
+
+[project.scripts]
+demucs-separator = "demucs_separator.run:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["demucs_separator*"]
