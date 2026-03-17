@@ -291,9 +291,9 @@ def process_job(job: dict, gpu_id: int, api_base: str, gpu_count: int, keeptemp:
             return
 
         try:
-            zip_path = tmp / "vocals.zip"
+            zip_path = tmp / f"vocals_{job_id}.zip"
             log.debug("[%s] Creating zip %s", job_id, zip_path)
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
                 zf.write(vocals_htdemucs, "vocals_htdemucs.wav")
                 zf.write(vocals_mdx_extra, "vocals_mdx_extra.wav")
             zip_size = zip_path.stat().st_size
