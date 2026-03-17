@@ -50,12 +50,15 @@ def claim_job(api_base: str) -> dict | None:
     resp = requests.post(f"{api_base}/job/claim", timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    job = data.get("job")
-    if job:
-        log.info("Claimed job id=%s file_url=%s", job.get("id"), job.get("file_url"))
+    job = data.get("job") if isinstance(data, dict) else None
+    if job and isinstance(job, dict) and job.get("id") and job.get("file_url"):
+        log.info("Claimed job id=%s file_url=%s", job["id"], job["file_url"])
+        return job
+    if job is not None:
+        log.warning("Claim response had job but invalid shape (missing id/file_url): %s", data)
     else:
-        log.debug("No pending jobs")
-    return job
+        log.debug("No pending jobs (response: %s)", data)
+    return None
 
 
 def mark_done(api_base: str, job_id: str, result_url: str) -> None:
@@ -78,6 +81,14 @@ def mark_fail(api_base: str, job_id: str) -> None:
     )
     resp.raise_for_status()
     log.debug("[%s] mark_fail response status=%d", job_id, resp.status_code)
+
+
+def _safe_mark_fail(api_base: str, job_id: str, context: str = "") -> None:
+    """Call mark_fail, log but do not raise if API call fails."""
+    try:
+        mark_fail(api_base, job_id)
+    except Exception as e:
+        log.exception("[%s] Failed to mark job as failed on API%s: %s", job_id, f" ({context})" if context else "", e)
 
 
 def _resolve_download_url(file_url: str, file_base: str) -> str:
@@ -241,7 +252,7 @@ def process_job(job: dict, gpu_id: int, api_base: str, gpu_count: int, keeptemp:
             log.debug("[%s] tmpdir=%s input_path=%s (detected ext=%s)", job_id, tmp, input_path, ext)
         except Exception as e:
             log.exception("[%s] Download failed: %s", job_id, e)
-            mark_fail(api_base, job_id)
+            _safe_mark_fail(api_base, job_id, "download")
             return
 
         try:
@@ -287,7 +298,7 @@ def process_job(job: dict, gpu_id: int, api_base: str, gpu_count: int, keeptemp:
             log.info("[%s] Separation done: htdemucs=%s mdx_extra=%s", job_id, vocals_htdemucs, vocals_mdx_extra)
         except Exception as e:
             log.exception("[%s] Separation failed: %s", job_id, e)
-            mark_fail(api_base, job_id)
+            _safe_mark_fail(api_base, job_id, "separation")
             return
 
         try:
@@ -304,7 +315,7 @@ def process_job(job: dict, gpu_id: int, api_base: str, gpu_count: int, keeptemp:
             log.info("[%s] Job complete -> %s", job_id, result_url)
         except Exception as e:
             log.exception("[%s] Upload failed: %s", job_id, e)
-            mark_fail(api_base, job_id)
+            _safe_mark_fail(api_base, job_id, "upload")
 
 
 def worker_loop(gpu_id: int, api_base: str, gpu_count: int, keeptemp: bool = False) -> None:
@@ -313,7 +324,11 @@ def worker_loop(gpu_id: int, api_base: str, gpu_count: int, keeptemp: bool = Fal
         try:
             job = claim_job(api_base)
             if job:
-                process_job(job, gpu_id, api_base, gpu_count, keeptemp)
+                try:
+                    process_job(job, gpu_id, api_base, gpu_count, keeptemp)
+                except Exception as e:
+                    log.exception("[GPU %s] Job failed (marking as failed on API): %s", gpu_id, e)
+                    _safe_mark_fail(api_base, job["id"], "worker_loop")
             else:
                 log.debug("[GPU %s] No job, sleeping %ds", gpu_id, POLL_INTERVAL_SEC)
                 time.sleep(POLL_INTERVAL_SEC)
