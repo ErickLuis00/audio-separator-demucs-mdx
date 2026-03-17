@@ -1,1 +1,2 @@
 demucs-infer>=4.0.0
+soundfile
