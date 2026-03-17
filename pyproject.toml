@@ -7,10 +7,11 @@ name = "demucs-separator"
 version = "1.0.0"
 description = "Local vocal separation using Demucs htdemucs and MDX mdx_extra via demucs-infer"
 requires-python = ">=3.12"
-dependencies = ["demucs-infer>=4.0.0"]
+dependencies = ["demucs-infer>=4.0.0", "requests>=2.28.0"]
 
 [project.scripts]
 demucs-separator = "demucs_separator.run:main"
+job-worker = "job_worker:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
