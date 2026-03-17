@@ -19,7 +19,11 @@ from pathlib import Path
 import requests
 
 API_BASE = "https://runpod-gpu.zauen.workers.dev"
+TEMP_UPLOAD_BASE = "https://temp-host.zauen.workers.dev"
 POLL_INTERVAL_SEC = 5
+
+MIN_PART_SIZE = 5 * 1024 * 1024  # 5 MiB (required by R2 except for last part)
+CHUNK_SIZE = 95 * 1024 * 1024   # 95 MiB = ~99.6 MB  ← leaves ~0.4 MB headroom for headers
 
 LOG_LEVEL = getattr(logging, os.environ.get("LOG_LEVEL", "DEBUG").upper(), logging.DEBUG)
 logging.basicConfig(
@@ -76,11 +80,11 @@ def mark_fail(api_base: str, job_id: str) -> None:
     log.debug("[%s] mark_fail response status=%d", job_id, resp.status_code)
 
 
-def _resolve_download_url(file_url: str, api_base: str) -> str:
-    """Resolve file_url to full download URL. file_url may be /download/{key} or absolute."""
+def _resolve_download_url(file_url: str, file_base: str) -> str:
+    """Resolve file_url to full download URL. All file transfers use file_base (temp-host), never api_base."""
     if file_url.startswith("http://") or file_url.startswith("https://"):
         return file_url
-    base = api_base.rstrip("/")
+    base = file_base.rstrip("/")
     path = file_url if file_url.startswith("/") else f"/{file_url}"
     return f"{base}{path}"
 
@@ -98,23 +102,82 @@ def download_file(url: str, dest: Path) -> tuple[int, str]:
     return size, final_url
 
 
-def upload_to_worker(file_path: Path, api_base: str) -> str:
-    """Upload file to Worker R2, return file_url (e.g. /download/{key}) for result_url."""
-    size = file_path.stat().st_size
-    log.debug("Uploading %s (%d bytes) to %s/upload", file_path, size, api_base)
-    with open(file_path, "rb") as f:
-        resp = requests.post(
-            f"{api_base.rstrip('/')}/upload",
-            files={"file": (file_path.name, f, "application/octet-stream")},
-            timeout=120,
-        )
+def _mpu_create(upload_base: str, filename: str, content_type: str) -> dict:
+    url = f"{upload_base.rstrip('/')}/uploads/{filename}"
+    resp = requests.post(url, params={"action": "mpu-create", "contentType": content_type}, timeout=30)
     resp.raise_for_status()
-    data = resp.json()
-    file_url = data.get("file_url")
-    if not file_url:
-        raise RuntimeError(f"Upload response missing file_url: {data}")
-    log.info("Uploaded to %s%s", api_base, file_url)
-    return file_url
+    return resp.json()
+
+
+def _mpu_upload_part(upload_base: str, filename: str, upload_id: str, part_number: int, chunk: bytes) -> dict:
+    url = f"{upload_base.rstrip('/')}/uploads/{filename}"
+    resp = requests.put(
+        url,
+        params={"action": "mpu-uploadpart", "uploadId": upload_id, "partNumber": part_number},
+        data=chunk,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _mpu_complete(upload_base: str, filename: str, upload_id: str, parts: list[dict]) -> dict:
+    url = f"{upload_base.rstrip('/')}/uploads/{filename}"
+    resp = requests.post(
+        url,
+        params={"action": "mpu-complete", "uploadId": upload_id},
+        json={"parts": parts},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _mpu_abort(upload_base: str, filename: str, upload_id: str) -> None:
+    url = f"{upload_base.rstrip('/')}/uploads/{filename}"
+    resp = requests.delete(url, params={"action": "mpu-abort", "uploadId": upload_id}, timeout=30)
+    resp.raise_for_status()
+
+
+def upload_file_multipart(file_path: Path, upload_base: str, content_type: str = "application/zip") -> str:
+    """Upload file via R2 multipart API. Returns full download URL for result_url."""
+    filename = file_path.name
+    size = file_path.stat().st_size
+    log.debug("Multipart upload %s (%d bytes) to %s", file_path, size, upload_base)
+
+    session = _mpu_create(upload_base, filename, content_type)
+    upload_id = session["uploadId"]
+    log.debug("Multipart session created uploadId=%s", upload_id)
+
+    parts: list[dict] = []
+    try:
+        with open(file_path, "rb") as f:
+            part_number = 1
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                is_last = len(chunk) < CHUNK_SIZE
+                if not is_last and len(chunk) < MIN_PART_SIZE:
+                    raise ValueError(
+                        f"Part {part_number} is {len(chunk)} bytes; "
+                        f"all non-final parts must be >= {MIN_PART_SIZE} bytes"
+                    )
+                result = _mpu_upload_part(upload_base, filename, upload_id, part_number, chunk)
+                parts.append({"partNumber": result["partNumber"], "etag": result["etag"]})
+                log.debug("Uploaded part %d (%d bytes)", part_number, len(chunk))
+                part_number += 1
+
+        result = _mpu_complete(upload_base, filename, upload_id, parts)
+        url = result.get("url")
+        if not url:
+            raise RuntimeError(f"Multipart complete response missing url: {result}")
+        log.info("Multipart upload complete -> %s", url)
+        return url
+    except Exception as e:
+        log.warning("Multipart upload failed, aborting: %s", e)
+        _mpu_abort(upload_base, filename, upload_id)
+        raise
 
 
 def _infer_extension_from_url(url: str) -> str | None:
@@ -162,6 +225,7 @@ def _job_work_dir(prefix: str, keeptemp: bool, job_id: str):
 def process_job(job: dict, gpu_id: int, api_base: str, gpu_count: int, keeptemp: bool = False) -> None:
     job_id = job["id"]
     file_url = job["file_url"]
+    file_base = os.environ.get("TEMP_UPLOAD_BASE", TEMP_UPLOAD_BASE)
     log.info("[%s] Processing job gpu_id=%s file_url=%s", job_id, gpu_id, file_url)
 
     with _job_work_dir("job_worker_", keeptemp, job_id) as tmp:
@@ -169,7 +233,7 @@ def process_job(job: dict, gpu_id: int, api_base: str, gpu_count: int, keeptemp:
         raw_path = tmp / "input_raw"
 
         try:
-            download_url = _resolve_download_url(file_url, api_base)
+            download_url = _resolve_download_url(file_url, file_base)
             _, final_url = download_file(download_url, raw_path)
             ext = _infer_extension_from_url(final_url) or _infer_extension_from_url(file_url) or _detect_audio_format(raw_path.read_bytes())
             input_path = tmp / f"input_audio{ext}"
@@ -234,7 +298,8 @@ def process_job(job: dict, gpu_id: int, api_base: str, gpu_count: int, keeptemp:
                 zf.write(vocals_mdx_extra, "vocals_mdx_extra.wav")
             zip_size = zip_path.stat().st_size
             log.info("[%s] Zip created %d bytes", job_id, zip_size)
-            result_url = upload_to_worker(zip_path, api_base)
+            upload_base = os.environ.get("TEMP_UPLOAD_BASE", TEMP_UPLOAD_BASE)
+            result_url = upload_file_multipart(zip_path, upload_base, content_type="application/zip")
             mark_done(api_base, job_id, result_url)
             log.info("[%s] Job complete -> %s", job_id, result_url)
         except Exception as e:
@@ -272,7 +337,11 @@ def main() -> None:
     gpu_count = get_gpu_count()
     workers = min(gpu_count, int(os.environ.get("WORKER_COUNT", gpu_count)))
 
-    log.info("Starting job worker: workers=%d gpu_count=%d api=%s keeptemp=%s", workers, gpu_count, api_base, args.keeptemp)
+    upload_base = os.environ.get("TEMP_UPLOAD_BASE", TEMP_UPLOAD_BASE)
+    log.info(
+        "Starting job worker: workers=%d gpu_count=%d api=%s upload=%s keeptemp=%s",
+        workers, gpu_count, api_base, upload_base, args.keeptemp,
+    )
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [

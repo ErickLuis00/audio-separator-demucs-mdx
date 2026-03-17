@@ -1,5 +1,9 @@
 
 
+# Large audio files (GitHub 100MB limit)
+*.WAV
+*.wav
+
 separated/
 .flash/
 output/
