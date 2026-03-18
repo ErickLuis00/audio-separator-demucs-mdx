@@ -70,6 +70,9 @@ def mark_done(api_base: str, job_id: str, result_url: str) -> None:
         json={"id": job_id, "result_url": result_url},
         timeout=30,
     )
+    if resp.status_code == 404:
+        log.warning("[%s] Job not found (404), likely deleted; skipping update and continuing", job_id)
+        return
     resp.raise_for_status()
     log.debug("[%s] mark_done response status=%d", job_id, resp.status_code)
 
@@ -81,6 +84,9 @@ def mark_fail(api_base: str, job_id: str) -> None:
         json={"id": job_id},
         timeout=30,
     )
+    if resp.status_code == 404:
+        log.warning("[%s] Job not found (404), likely deleted; skipping update and continuing", job_id)
+        return
     resp.raise_for_status()
     log.debug("[%s] mark_fail response status=%d", job_id, resp.status_code)
 
@@ -366,6 +372,7 @@ def worker_loop(gpu_id: int, api_base: str, gpu_count: int, keeptemp: bool = Fal
                 except Exception as e:
                     log.exception("[GPU %s] Job failed (marking as failed on API): %s", gpu_id, e)
                     _safe_mark_fail(api_base, job["id"], "worker_loop")
+                    log.info("[GPU %s] Continuing to poll after job failure", gpu_id)
             else:
                 log.debug("[GPU %s] No job, sleeping %ds", gpu_id, POLL_INTERVAL_SEC)
                 time.sleep(POLL_INTERVAL_SEC)
@@ -373,6 +380,7 @@ def worker_loop(gpu_id: int, api_base: str, gpu_count: int, keeptemp: bool = Fal
             raise
         except Exception as e:
             log.exception("[GPU %s] Error: %s", gpu_id, e)
+            log.info("[GPU %s] Continuing to poll after error", gpu_id)
             time.sleep(POLL_INTERVAL_SEC)
 
 
