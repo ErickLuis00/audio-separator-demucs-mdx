@@ -4,6 +4,8 @@
 *.WAV
 *.wav
 
+*.mp3
+
 separated/
 .flash/
 output/

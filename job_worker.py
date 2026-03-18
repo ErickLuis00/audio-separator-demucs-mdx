@@ -18,6 +18,8 @@ from pathlib import Path
 
 import requests
 
+from compress_audio import convert_to_mp3
+
 API_BASE = "https://runpod-gpu.zauen.workers.dev"
 TEMP_UPLOAD_BASE = "https://temp-host.zauen.workers.dev"
 POLL_INTERVAL_SEC = 5
@@ -244,6 +246,7 @@ def process_job(job: dict, gpu_id: int, api_base: str, gpu_count: int, keeptemp:
         raw_path = tmp / "input_raw"
 
         try:
+            log.info("[%s] Downloading input from %s", job_id, file_url)
             download_url = _resolve_download_url(file_url, file_base)
             _, final_url = download_file(download_url, raw_path)
             ext = _infer_extension_from_url(final_url) or _infer_extension_from_url(file_url) or _detect_audio_format(raw_path.read_bytes())
@@ -302,15 +305,49 @@ def process_job(job: dict, gpu_id: int, api_base: str, gpu_count: int, keeptemp:
             return
 
         try:
+            compress_dir = tmp / "compressed"
+            compress_dir.mkdir(parents=True, exist_ok=True)
+            out_ht = compress_dir / "htdemucs"
+            out_mdx = compress_dir / "mdx_extra"
+            out_ht.mkdir(parents=True, exist_ok=True)
+            out_mdx.mkdir(parents=True, exist_ok=True)
+
+            log.info("[%s] Compressing vocals to MP3: htdemucs", job_id)
+            t0 = time.perf_counter()
+            mp3_htdemucs = convert_to_mp3(vocals_htdemucs, out_ht, show_progress=False, lock=None)
+            elapsed_ht = time.perf_counter() - t0
+            size_wav = vocals_htdemucs.stat().st_size
+            size_mp3 = mp3_htdemucs.stat().st_size
+            saved_pct_ht = (1 - size_mp3 / size_wav) * 100 if size_wav else 0
+            log.info("[%s] Compressed htdemucs: %.1fs, %d bytes -> %d bytes (%.1f%% saved)", job_id, elapsed_ht, size_wav, size_mp3, saved_pct_ht)
+
+            log.info("[%s] Compressing vocals to MP3: mdx_extra", job_id)
+            t0 = time.perf_counter()
+            mp3_mdx_extra = convert_to_mp3(vocals_mdx_extra, out_mdx, show_progress=False, lock=None)
+            elapsed_mdx = time.perf_counter() - t0
+            size_wav = vocals_mdx_extra.stat().st_size
+            size_mp3 = mp3_mdx_extra.stat().st_size
+            saved_pct_mdx = (1 - size_mp3 / size_wav) * 100 if size_wav else 0
+            log.info("[%s] Compressed mdx_extra: %.1fs, %d bytes -> %d bytes (%.1f%% saved)", job_id, elapsed_mdx, size_wav, size_mp3, saved_pct_mdx)
+
+            log.info("[%s] Compression complete, creating zip", job_id)
+        except Exception as e:
+            log.exception("[%s] MP3 compression failed: %s", job_id, e)
+            _safe_mark_fail(api_base, job_id, "compression")
+            return
+
+        try:
             zip_path = tmp / f"vocals_{job_id}.zip"
-            log.debug("[%s] Creating zip %s", job_id, zip_path)
+            log.debug("[%s] Creating zip %s with MP3 files", job_id, zip_path)
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-                zf.write(vocals_htdemucs, "vocals_htdemucs.wav")
-                zf.write(vocals_mdx_extra, "vocals_mdx_extra.wav")
+                zf.write(mp3_htdemucs, "vocals_htdemucs.mp3")
+                zf.write(mp3_mdx_extra, "vocals_mdx_extra.mp3")
             zip_size = zip_path.stat().st_size
-            log.info("[%s] Zip created %d bytes", job_id, zip_size)
+            log.info("[%s] Zip created %d bytes (vocals_htdemucs.mp3, vocals_mdx_extra.mp3)", job_id, zip_size)
             upload_base = os.environ.get("TEMP_UPLOAD_BASE", TEMP_UPLOAD_BASE)
+            log.info("[%s] Uploading zip to %s", job_id, upload_base)
             result_url = upload_file_multipart(zip_path, upload_base, content_type="application/zip")
+            log.info("[%s] Upload complete, marking job done", job_id)
             mark_done(api_base, job_id, result_url)
             log.info("[%s] Job complete -> %s", job_id, result_url)
         except Exception as e:
